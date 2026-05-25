@@ -5,6 +5,7 @@ use base64::display::Base64Display;
 use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::{self, RngExt};
+use sha1::Sha1;
 use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -43,6 +44,27 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn hex_decode(data: &str) -> Result<Vec<u8>, String> {
+    if data.len() % 2 != 0 {
+        return Err("invalid hex length".into());
+    }
+
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let bytes = data.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        let lo = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
 /// Derive salted password for GaussDB SHA256 authentication.
 /// GaussDB pre-hashes the password with SHA256 and hex-encodes it
 /// before feeding it to the Hi() function.
@@ -55,7 +77,12 @@ fn derive_gaussdb_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 
 /// Derive salted password for GaussDB MD5_SHA256 authentication.
 /// GaussDB computes MD5(password + username), then SHA256("md5" + md5_hex),
 /// then feeds the hex-encoded result to Hi().
-fn derive_gaussdb_md5_sha256(password: &[u8], username: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+fn derive_gaussdb_md5_sha256(
+    password: &[u8],
+    username: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; 32] {
     let mut hasher = md5::Md5::new();
     hasher.update(password);
     hasher.update(username.as_bytes());
@@ -65,6 +92,72 @@ fn derive_gaussdb_md5_sha256(password: &[u8], username: &str, salt: &[u8], itera
     let sha_result = sha2::Sha256::digest(md5_hex.as_bytes());
     let sha_hex = hex_encode(&sha_result);
     hi(sha_hex.as_bytes(), salt, iterations)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hmac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC is able to accept all key sizes");
+    hmac.update(data);
+    hmac.finalize().into_bytes().into()
+}
+
+fn detect_iteration(
+    password: &[u8],
+    salt: &[u8],
+    token_bytes: &[u8],
+    expected_sig_hex: &str,
+    server_iteration: u32,
+) -> Result<u32, String> {
+    let expected_sig = hex_decode(expected_sig_hex)?;
+
+    for &candidate in &[server_iteration, 10000, 2048] {
+        let mut k = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, candidate, &mut k);
+        let server_key = hmac_sha256(&k, b"Sever Key");
+        let candidate_sig = hmac_sha256(&server_key, token_bytes);
+        if candidate_sig.as_slice() == expected_sig.as_slice() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("unable to match GaussDB server iteration".into())
+}
+
+/// Computes the legacy/openGauss-style SHA256 challenge-response proof used by
+/// GaussDB's non-standard `AuthenticationSASL` variant.
+pub fn gaussdb_rfc5802_sha256(
+    password: &[u8],
+    random64code: &str,
+    token: &str,
+    server_signature_hex: Option<&str>,
+    server_iteration: u32,
+) -> Result<String, String> {
+    let salt = hex_decode(random64code)?;
+    let token_bytes = hex_decode(token)?;
+
+    let iteration = if let Some(expected_sig) = server_signature_hex {
+        detect_iteration(
+            password,
+            &salt,
+            &token_bytes,
+            expected_sig,
+            server_iteration,
+        )?
+    } else {
+        server_iteration
+    };
+
+    let mut k = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha1>(password, &salt, iteration, &mut k);
+    let client_key = hmac_sha256(&k, b"Client Key");
+    let stored_key = Sha256::digest(client_key);
+    let hmac_result = hmac_sha256(stored_key.as_slice(), &token_bytes);
+    let mut proof = hmac_result;
+    for (a, b) in proof.iter_mut().zip(client_key.iter()) {
+        *a ^= b;
+    }
+
+    Ok(hex_encode(&proof))
 }
 
 pub(crate) fn hi(str: &[u8], salt: &[u8], i: u32) -> [u8; 32] {
