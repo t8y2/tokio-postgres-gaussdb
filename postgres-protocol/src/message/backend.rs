@@ -360,6 +360,72 @@ impl AuthenticationSaslBody {
     pub fn mechanisms(&self) -> SaslMechanisms<'_> {
         SaslMechanisms(&self.0)
     }
+
+    #[inline]
+    pub fn gaussdb_sha256(&self) -> io::Result<Option<AuthenticationGaussdbSha256Body>> {
+        if self.0.len() < 4 || self.0[0] != 0 {
+            return Ok(None);
+        }
+
+        let password_stored_method = BigEndian::read_i32(&self.0[..4]);
+        let remaining = &self.0[4..];
+        if !(password_stored_method == 2 || password_stored_method == 0) || remaining.len() < 72 {
+            return Ok(None);
+        }
+
+        let random64code = get_str(&remaining[..64])?.to_string();
+        let token = get_str(&remaining[64..72])?.to_string();
+
+        let (server_signature, server_iteration) =
+            if remaining.len() >= 136 && remaining.len() < 140 {
+                (Some(get_str(&remaining[72..])?.to_string()), 10000u32)
+            } else if remaining.len() == 76 {
+                (None, BigEndian::read_i32(&remaining[72..76]) as u32)
+            } else if remaining.len() >= 140 {
+                (
+                    Some(get_str(&remaining[72..136])?.to_string()),
+                    BigEndian::read_i32(&remaining[136..140]) as u32,
+                )
+            } else {
+                (None, 10000u32)
+            };
+
+        Ok(Some(AuthenticationGaussdbSha256Body {
+            random64code,
+            token,
+            server_signature,
+            server_iteration,
+        }))
+    }
+}
+
+pub struct AuthenticationGaussdbSha256Body {
+    random64code: String,
+    token: String,
+    server_signature: Option<String>,
+    server_iteration: u32,
+}
+
+impl AuthenticationGaussdbSha256Body {
+    #[inline]
+    pub fn random64code(&self) -> &str {
+        &self.random64code
+    }
+
+    #[inline]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[inline]
+    pub fn server_signature(&self) -> Option<&str> {
+        self.server_signature.as_deref()
+    }
+
+    #[inline]
+    pub fn server_iteration(&self) -> u32 {
+        self.server_iteration
+    }
 }
 
 pub struct SaslMechanisms<'a>(&'a [u8]);
@@ -370,6 +436,28 @@ impl<'a> FallibleIterator for SaslMechanisms<'a> {
 
     #[inline]
     fn next(&mut self) -> io::Result<Option<&'a str>> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+
+        // GaussDB can encode the SASL mechanism selection in a non-standard
+        // AuthenticationSASL body: int32 password_stored_method followed by
+        // mechanism-specific payload rather than a cstring mechanism list.
+        if self.0.len() >= 4 && self.0[0] == 0 {
+            let mechanism = match BigEndian::read_i32(&self.0[..4]) {
+                2 => "SHA256",
+                3 => "MD5_SHA256",
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported GaussDB SASL mechanism tag `{other}`"),
+                    ));
+                }
+            };
+            self.0 = &[];
+            return Ok(Some(mechanism));
+        }
+
         let value_end = find_null(self.0, 0)?;
         if value_end == 0 {
             if self.0.len() != 1 {

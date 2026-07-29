@@ -250,6 +250,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: TlsStream + Unpin,
 {
+    if let Some(gaussdb_body) = body.gaussdb_sha256().map_err(Error::parse)? {
+        return authenticate_gaussdb_sha256(stream, gaussdb_body, config).await;
+    }
+
     let password = config
         .password
         .as_ref()
@@ -257,11 +261,15 @@ where
 
     let mut has_scram = false;
     let mut has_scram_plus = false;
+    let mut has_gaussdb_sha256 = false;
+    let mut has_gaussdb_md5_sha256 = false;
     let mut mechanisms = body.mechanisms();
     while let Some(mechanism) = mechanisms.next().map_err(Error::parse)? {
         match mechanism {
             sasl::SCRAM_SHA_256 => has_scram = true,
             sasl::SCRAM_SHA_256_PLUS => has_scram_plus = true,
+            sasl::GAUSSDB_SHA256 => has_gaussdb_sha256 = true,
+            sasl::GAUSSDB_MD5_SHA256 => has_gaussdb_md5_sha256 = true,
             _ => {}
         }
     }
@@ -274,16 +282,40 @@ where
         .filter(|_| config.channel_binding != config::ChannelBinding::Disable)
         .map(sasl::ChannelBinding::tls_server_end_point);
 
-    let (channel_binding, mechanism) = if has_scram_plus {
+    let (channel_binding, mechanism, is_gaussdb) = if has_scram_plus {
         match channel_binding {
-            Some(channel_binding) => (channel_binding, sasl::SCRAM_SHA_256_PLUS),
-            None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+            Some(channel_binding) => (channel_binding, sasl::SCRAM_SHA_256_PLUS, false),
+            None => (
+                sasl::ChannelBinding::unsupported(),
+                sasl::SCRAM_SHA_256,
+                false,
+            ),
         }
     } else if has_scram {
         match channel_binding {
-            Some(_) => (sasl::ChannelBinding::unrequested(), sasl::SCRAM_SHA_256),
-            None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+            Some(_) => (
+                sasl::ChannelBinding::unrequested(),
+                sasl::SCRAM_SHA_256,
+                false,
+            ),
+            None => (
+                sasl::ChannelBinding::unsupported(),
+                sasl::SCRAM_SHA_256,
+                false,
+            ),
         }
+    } else if has_gaussdb_sha256 {
+        (
+            sasl::ChannelBinding::unsupported(),
+            sasl::GAUSSDB_SHA256,
+            true,
+        )
+    } else if has_gaussdb_md5_sha256 {
+        (
+            sasl::ChannelBinding::unsupported(),
+            sasl::GAUSSDB_MD5_SHA256,
+            true,
+        )
     } else {
         return Err(Error::authentication("unsupported SASL mechanism".into()));
     };
@@ -292,7 +324,16 @@ where
         can_skip_channel_binding(config)?;
     }
 
-    let mut scram = ScramSha256::new(password, channel_binding);
+    let mut scram = if is_gaussdb {
+        if mechanism == sasl::GAUSSDB_SHA256 {
+            ScramSha256::new_gaussdb_sha256(password, channel_binding)
+        } else {
+            let username = config.user.as_deref().unwrap_or("");
+            ScramSha256::new_gaussdb_md5_sha256(password, username, channel_binding)
+        }
+    } else {
+        ScramSha256::new(password, channel_binding)
+    };
 
     let mut buf = BytesMut::new();
     frontend::sasl_initial_response(mechanism, scram.message(), &mut buf).map_err(Error::encode)?;
@@ -331,6 +372,36 @@ where
         .map_err(|e| Error::authentication(e.into()))?;
 
     Ok(())
+}
+
+async fn authenticate_gaussdb_sha256<S, T>(
+    stream: &mut StartupStream<S, T>,
+    body: postgres_protocol::message::backend::AuthenticationGaussdbSha256Body,
+    config: &Config,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: TlsStream + Unpin,
+{
+    can_skip_channel_binding(config)?;
+
+    let password = config
+        .password
+        .as_ref()
+        .ok_or_else(|| Error::config("password missing".into()))?;
+
+    let proof = sasl::gaussdb_rfc5802_sha256(
+        password,
+        body.random64code(),
+        body.token(),
+        body.server_signature(),
+        body.server_iteration(),
+    )
+    .map_err(|err| {
+        Error::authentication(Box::new(io::Error::new(io::ErrorKind::InvalidData, err)))
+    })?;
+
+    authenticate_password(stream, proof.as_bytes()).await
 }
 
 async fn read_info<S, T>(

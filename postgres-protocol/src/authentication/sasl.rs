@@ -5,6 +5,7 @@ use base64::display::Base64Display;
 use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::{self, RngExt};
+use sha1::Sha1;
 use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -29,6 +30,10 @@ const MAX_ITERATION_COUNT: u32 = 100_000;
 pub const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 /// The identifier of the SCRAM-SHA-256-PLUS SASL authentication mechanism.
 pub const SCRAM_SHA_256_PLUS: &str = "SCRAM-SHA-256-PLUS";
+/// The identifier of the GaussDB/openGauss SHA256 SASL authentication mechanism.
+pub const GAUSSDB_SHA256: &str = "SHA256";
+/// The identifier of the GaussDB/openGauss MD5_SHA256 SASL authentication mechanism.
+pub const GAUSSDB_MD5_SHA256: &str = "MD5_SHA256";
 
 // since postgres passwords are not required to exclude saslprep-prohibited
 // characters or even be valid UTF8, we run saslprep if possible and otherwise
@@ -43,6 +48,126 @@ fn normalize(pass: &[u8]) -> Vec<u8> {
         Ok(pass) => pass.into_owned().into_bytes(),
         Err(_) => pass.as_bytes().to_vec(),
     }
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(data: &str) -> Result<Vec<u8>, String> {
+    if data.len() % 2 != 0 {
+        return Err("invalid hex length".into());
+    }
+
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let bytes = data.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        let lo = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Derive salted password for GaussDB SHA256 authentication.
+/// GaussDB pre-hashes the password with SHA256 and hex-encodes it
+/// before feeding it to the Hi() function.
+fn derive_gaussdb_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let pwd_sha = sha2::Sha256::digest(password);
+    let pwd_hex = hex_encode(&pwd_sha);
+    hi(pwd_hex.as_bytes(), salt, iterations)
+}
+
+/// Derive salted password for GaussDB MD5_SHA256 authentication.
+/// GaussDB computes MD5(password + username), then SHA256("md5" + md5_hex),
+/// then feeds the hex-encoded result to Hi().
+fn derive_gaussdb_md5_sha256(
+    password: &[u8],
+    username: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; 32] {
+    let mut hasher = md5::Md5::new();
+    hasher.update(password);
+    hasher.update(username.as_bytes());
+    let md5_result = hasher.finalize();
+    let md5_hex = format!("md5{}", hex_encode(&md5_result));
+
+    let sha_result = sha2::Sha256::digest(md5_hex.as_bytes());
+    let sha_hex = hex_encode(&sha_result);
+    hi(sha_hex.as_bytes(), salt, iterations)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hmac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC is able to accept all key sizes");
+    hmac.update(data);
+    hmac.finalize().into_bytes().into()
+}
+
+fn detect_iteration(
+    password: &[u8],
+    salt: &[u8],
+    token_bytes: &[u8],
+    expected_sig_hex: &str,
+    server_iteration: u32,
+) -> Result<u32, String> {
+    let expected_sig = hex_decode(expected_sig_hex)?;
+
+    for &candidate in &[server_iteration, 10000, 2048] {
+        let mut k = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, candidate, &mut k);
+        let server_key = hmac_sha256(&k, b"Sever Key");
+        let candidate_sig = hmac_sha256(&server_key, token_bytes);
+        if candidate_sig.as_slice() == expected_sig.as_slice() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("unable to match GaussDB server iteration".into())
+}
+
+/// Computes the legacy/openGauss-style SHA256 challenge-response proof used by
+/// GaussDB's non-standard `AuthenticationSASL` variant.
+pub fn gaussdb_rfc5802_sha256(
+    password: &[u8],
+    random64code: &str,
+    token: &str,
+    server_signature_hex: Option<&str>,
+    server_iteration: u32,
+) -> Result<String, String> {
+    let salt = hex_decode(random64code)?;
+    let token_bytes = hex_decode(token)?;
+
+    let iteration = if let Some(expected_sig) = server_signature_hex {
+        detect_iteration(
+            password,
+            &salt,
+            &token_bytes,
+            expected_sig,
+            server_iteration,
+        )?
+    } else {
+        server_iteration
+    };
+
+    let mut k = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha1>(password, &salt, iteration, &mut k);
+    let client_key = hmac_sha256(&k, b"Client Key");
+    let stored_key = Sha256::digest(client_key);
+    let hmac_result = hmac_sha256(stored_key.as_slice(), &token_bytes);
+    let mut proof = hmac_result;
+    for (a, b) in proof.iter_mut().zip(client_key.iter()) {
+        *a ^= b;
+    }
+
+    Ok(hex_encode(&proof))
 }
 
 pub(crate) fn hi(str: &[u8], salt: &[u8], i: u32) -> [u8; 32] {
@@ -109,11 +234,20 @@ impl ChannelBinding {
     }
 }
 
+/// Which SASL mechanism variant to use for password derivation.
+#[derive(Clone)]
+enum Mechanism {
+    ScramSha256,
+    GaussdbSha256,
+    GaussdbMd5Sha256 { username: String },
+}
+
 enum State {
     Update {
         nonce: String,
         password: Vec<u8>,
         channel_binding: ChannelBinding,
+        mechanism: Mechanism,
     },
     Finish {
         salted_password: [u8; 32],
@@ -145,28 +279,58 @@ pub struct ScramSha256 {
 impl ScramSha256 {
     /// Constructs a new instance which will use the provided password for authentication.
     pub fn new(password: &[u8], channel_binding: ChannelBinding) -> ScramSha256 {
-        // rand 0.5's ThreadRng is cryptographically secure
-        let mut rng = rand::rng();
-        let nonce = (0..NONCE_LENGTH)
-            .map(|_| {
-                let mut v = rng.random_range(0x21u8..0x7e);
-                if v == 0x2c {
-                    v = 0x7e
-                }
-                v as char
-            })
-            .collect::<String>();
-
-        ScramSha256::new_inner(password, channel_binding, nonce)
+        ScramSha256::new_inner(password, channel_binding, Mechanism::ScramSha256, None)
     }
 
-    fn new_inner(password: &[u8], channel_binding: ChannelBinding, nonce: String) -> ScramSha256 {
+    /// Constructs a new instance for GaussDB SHA256 authentication.
+    /// Uses GaussDB's password derivation (SHA256 + hex-encode before Hi()).
+    pub fn new_gaussdb_sha256(password: &[u8], channel_binding: ChannelBinding) -> ScramSha256 {
+        ScramSha256::new_inner(password, channel_binding, Mechanism::GaussdbSha256, None)
+    }
+
+    /// Constructs a new instance for GaussDB MD5_SHA256 authentication.
+    /// Uses GaussDB's MD5 + SHA256 password derivation before Hi().
+    pub fn new_gaussdb_md5_sha256(
+        password: &[u8],
+        username: &str,
+        channel_binding: ChannelBinding,
+    ) -> ScramSha256 {
+        ScramSha256::new_inner(
+            password,
+            channel_binding,
+            Mechanism::GaussdbMd5Sha256 {
+                username: username.to_string(),
+            },
+            None,
+        )
+    }
+
+    fn new_inner(
+        password: &[u8],
+        channel_binding: ChannelBinding,
+        mechanism: Mechanism,
+        nonce: Option<String>,
+    ) -> ScramSha256 {
+        let nonce = nonce.unwrap_or_else(|| {
+            let mut rng = rand::rng();
+            (0..NONCE_LENGTH)
+                .map(|_| {
+                    let mut v = rng.random_range(0x21u8..0x7e);
+                    if v == 0x2c {
+                        v = 0x7e
+                    }
+                    v as char
+                })
+                .collect::<String>()
+        });
+
         ScramSha256 {
             message: format!("{}n=,r={}", channel_binding.gs2_header(), nonce),
             state: State::Update {
                 nonce,
                 password: normalize(password),
                 channel_binding,
+                mechanism,
             },
         }
     }
@@ -183,13 +347,14 @@ impl ScramSha256 {
     ///
     /// This should be called when an `AuthenticationSASLContinue` message is received.
     pub fn update(&mut self, message: &[u8]) -> io::Result<()> {
-        let (client_nonce, password, channel_binding) =
+        let (client_nonce, password, channel_binding, mechanism) =
             match mem::replace(&mut self.state, State::Done) {
                 State::Update {
                     nonce,
                     password,
                     channel_binding,
-                } => (nonce, password, channel_binding),
+                    mechanism,
+                } => (nonce, password, channel_binding, mechanism),
                 _ => return Err(io::Error::other("invalid SCRAM state")),
             };
 
@@ -214,7 +379,15 @@ impl ScramSha256 {
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
         };
 
-        let salted_password = hi(&password, &salt, parsed.iteration_count);
+        let salted_password = match &mechanism {
+            Mechanism::ScramSha256 => hi(&password, &salt, parsed.iteration_count),
+            Mechanism::GaussdbSha256 => {
+                derive_gaussdb_sha256(&password, &salt, parsed.iteration_count)
+            }
+            Mechanism::GaussdbMd5Sha256 { username } => {
+                derive_gaussdb_md5_sha256(&password, username, &salt, parsed.iteration_count)
+            }
+        };
 
         let mut hmac = Hmac::<Sha256>::new_from_slice(&salted_password)
             .expect("HMAC is able to accept all key sizes");
@@ -492,7 +665,8 @@ mod test {
         let mut scram = ScramSha256::new_inner(
             password.as_bytes(),
             ChannelBinding::unsupported(),
-            nonce.to_string(),
+            Mechanism::ScramSha256,
+            Some(nonce.to_string()),
         );
         assert_eq!(str::from_utf8(scram.message()).unwrap(), client_first);
 
