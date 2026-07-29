@@ -684,8 +684,12 @@ mod test {
         let server_first =
             "r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,s=fs3IXBy7U7+IvVjZ,i=1000000";
 
-        let mut scram =
-            ScramSha256::new_inner(b"foobar", ChannelBinding::unsupported(), nonce.to_string());
+        let mut scram = ScramSha256::new_inner(
+            b"foobar",
+            ChannelBinding::unsupported(),
+            Mechanism::ScramSha256,
+            Some(nonce.to_string()),
+        );
         assert!(scram.update(server_first.as_bytes()).is_err());
     }
 }
