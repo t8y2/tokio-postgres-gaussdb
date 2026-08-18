@@ -1050,6 +1050,31 @@ async fn query_typed_one() {
 }
 
 #[tokio::test]
+async fn query_typed_raw_exposes_columns_before_rows() {
+    let client = connect("user=postgres").await;
+
+    let stream = client
+        .query_typed_raw(
+            "SELECT 1::INT4 AS value",
+            std::iter::empty::<(&i32, Type)>(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.columns()[0].name(), "value");
+    assert_eq!(stream.columns()[0].type_(), &Type::INT4);
+
+    let empty_stream = client
+        .query_typed_raw(
+            "SELECT 1::INT4 AS value WHERE false",
+            std::iter::empty::<(&i32, Type)>(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_stream.columns()[0].name(), "value");
+    assert_eq!(empty_stream.columns()[0].type_(), &Type::INT4);
+}
+
+#[tokio::test]
 async fn query_opt() {
     let client = connect("user=postgres").await;
 
