@@ -8,6 +8,7 @@ use rand::{self, RngExt};
 use sha1::Sha1;
 use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
+use sm3::Sm3;
 use std::fmt::Write;
 use std::io;
 use std::iter;
@@ -117,13 +118,14 @@ fn detect_iteration(
     token_bytes: &[u8],
     expected_sig_hex: &str,
     server_iteration: u32,
+    server_key_label: &[u8],
 ) -> Result<u32, String> {
     let expected_sig = hex_decode(expected_sig_hex)?;
 
     for &candidate in &[server_iteration, 10000, 2048] {
         let mut k = [0u8; 32];
         pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, candidate, &mut k);
-        let server_key = hmac_sha256(&k, b"Sever Key");
+        let server_key = hmac_sha256(&k, server_key_label);
         let candidate_sig = hmac_sha256(&server_key, token_bytes);
         if candidate_sig.as_slice() == expected_sig.as_slice() {
             return Ok(candidate);
@@ -142,6 +144,45 @@ pub fn gaussdb_rfc5802_sha256(
     server_signature_hex: Option<&str>,
     server_iteration: u32,
 ) -> Result<String, String> {
+    // "Sever Key" (sic) is the label the GaussDB server uses for SHA256.
+    gaussdb_rfc5802::<Sha256>(
+        password,
+        random64code,
+        token,
+        server_signature_hex,
+        server_iteration,
+        b"Sever Key",
+    )
+}
+
+/// Computes the GaussDB/openGauss SM3 challenge-response proof
+/// (`AUTH_REQ_SM3`, `password_encryption_type = 3`). It is the SHA256 proof
+/// with the stored key hashed by SM3.
+pub fn gaussdb_rfc5802_sm3(
+    password: &[u8],
+    random64code: &str,
+    token: &str,
+    server_signature_hex: Option<&str>,
+    server_iteration: u32,
+) -> Result<String, String> {
+    gaussdb_rfc5802::<Sm3>(
+        password,
+        random64code,
+        token,
+        server_signature_hex,
+        server_iteration,
+        b"Server Key",
+    )
+}
+
+fn gaussdb_rfc5802<D: Digest>(
+    password: &[u8],
+    random64code: &str,
+    token: &str,
+    server_signature_hex: Option<&str>,
+    server_iteration: u32,
+    server_key_label: &[u8],
+) -> Result<String, String> {
     let salt = hex_decode(random64code)?;
     let token_bytes = hex_decode(token)?;
 
@@ -152,6 +193,7 @@ pub fn gaussdb_rfc5802_sha256(
             &token_bytes,
             expected_sig,
             server_iteration,
+            server_key_label,
         )?
     } else {
         server_iteration
@@ -160,7 +202,7 @@ pub fn gaussdb_rfc5802_sha256(
     let mut k = [0u8; 32];
     pbkdf2::pbkdf2_hmac::<Sha1>(password, &salt, iteration, &mut k);
     let client_key = hmac_sha256(&k, b"Client Key");
-    let stored_key = Sha256::digest(client_key);
+    let stored_key = D::digest(client_key);
     let hmac_result = hmac_sha256(stored_key.as_slice(), &token_bytes);
     let mut proof = hmac_result;
     for (a, b) in proof.iter_mut().zip(client_key.iter()) {
@@ -691,5 +733,75 @@ mod test {
             Some(nonce.to_string()),
         );
         assert!(scram.update(server_first.as_bytes()).is_err());
+    }
+
+    type GaussdbProof = fn(&[u8], &str, &str, Option<&str>, u32) -> Result<String, String>;
+
+    /// `pg_authid.rolpassword` values written by openGauss 6.0.0 for
+    /// `CREATE USER ... PASSWORD '<password>'` with `password_encryption_type`
+    /// 3 (SM3) and 2 (SHA256): prefix, then salt, server key and stored key
+    /// (64 hex chars each), then the iteration marker (10000 iterations).
+    const GAUSSDB_STORED_PASSWORDS: [(&str, &str, &str, GaussdbProof); 2] = [
+        (
+            "sm3",
+            "Fixture_Sm3_1",
+            "sm32c435cf25c4281aadf6230c5215e270cb37c235548a5f1b341876aca67da65550cee13cce068ee7f455567c2ed0d006ba1ca767d31ee3b8197dc5c8cd9061fb0ac6000eefa92053c09a79d9afcc86a694a668bb9501d98075e9de8315cbec8e3ecdfecefade",
+            gaussdb_rfc5802_sm3,
+        ),
+        (
+            "sha256",
+            "Fixture_Sha_1",
+            "sha256cb404a784622d21942da59d230f5fe59d7fab5e34f28e9452d5ebe1420d1191eb147c579d408dd70c6d12b09693dc667ba5cbb0dfc364ba146549150775655ba3fe7e923923388c17791671859e7ff02537a1cfb4303502e4a9f3b766dd6c9c2ecdfecefade",
+            gaussdb_rfc5802_sha256,
+        ),
+    ];
+
+    /// Checks a proof the way the GaussDB server does: recover the client key
+    /// from the proof and compare its hash with the stored key.
+    fn server_accepts(prefix: &str, proof: &str, stored_key: &[u8], token: &[u8]) -> bool {
+        let client_signature = hmac_sha256(stored_key, token);
+        let client_key: Vec<u8> = hex_decode(proof)
+            .unwrap()
+            .iter()
+            .zip(client_signature)
+            .map(|(a, b)| a ^ b)
+            .collect();
+        let hashed = match prefix {
+            "sm3" => Sm3::digest(&client_key).to_vec(),
+            _ => Sha256::digest(&client_key).to_vec(),
+        };
+        hashed == stored_key
+    }
+
+    #[test]
+    fn gaussdb_proof_is_accepted_by_server_stored_password() {
+        let token = "5d1e7c3b";
+        let token_bytes = hex_decode(token).unwrap();
+
+        for (prefix, password, rolpassword, compute_proof) in GAUSSDB_STORED_PASSWORDS {
+            let keys = &rolpassword[prefix.len()..];
+            let salt = &keys[..64];
+            let server_key = hex_decode(&keys[64..128]).unwrap();
+            let stored_key = hex_decode(&keys[128..192]).unwrap();
+            // Sent instead of the iteration count to protocol < 3.50 clients.
+            let server_signature = hex_encode(&hmac_sha256(&server_key, &token_bytes));
+
+            for (signature, iteration) in [(Some(server_signature.as_str()), 2048), (None, 10000)] {
+                let proof = compute_proof(password.as_bytes(), salt, token, signature, iteration)
+                    .unwrap_or_else(|err| panic!("{prefix}: {err}"));
+                assert!(
+                    server_accepts(prefix, &proof, &stored_key, &token_bytes),
+                    "{prefix}: proof rejected (signature: {})",
+                    signature.is_some()
+                );
+            }
+
+            let wrong = compute_proof(b"wrong", salt, token, None, 10000).unwrap();
+            assert!(!server_accepts(prefix, &wrong, &stored_key, &token_bytes));
+            assert!(
+                compute_proof(b"wrong", salt, token, Some(&server_signature), 10000).is_err(),
+                "{prefix}: a wrong password must not match the server signature"
+            );
+        }
     }
 }

@@ -33,6 +33,11 @@ pub const PARAMETER_DESCRIPTION_TAG: u8 = b't';
 pub const ROW_DESCRIPTION_TAG: u8 = b'T';
 pub const READY_FOR_QUERY_TAG: u8 = b'Z';
 
+/// GaussDB/openGauss `AUTH_REQ_SM3` authentication request code.
+const GAUSSDB_AUTH_REQ_SM3: i32 = 13;
+/// GaussDB/openGauss `SM3_PASSWORD` password stored method.
+const GAUSSDB_SM3_PASSWORD: i32 = 3;
+
 #[derive(Debug, Copy, Clone)]
 pub struct Header {
     tag: u8,
@@ -85,6 +90,7 @@ pub enum Message {
     AuthenticationSasl(AuthenticationSaslBody),
     AuthenticationSaslContinue(AuthenticationSaslContinueBody),
     AuthenticationSaslFinal(AuthenticationSaslFinalBody),
+    AuthenticationGaussdbSm3(AuthenticationGaussdbRfc5802Body),
     BackendKeyData(BackendKeyDataBody),
     BindComplete,
     CloseComplete,
@@ -232,6 +238,26 @@ impl Message {
                     let storage = buf.read_all();
                     Message::AuthenticationSaslFinal(AuthenticationSaslFinalBody(storage))
                 }
+                GAUSSDB_AUTH_REQ_SM3 => {
+                    let password_stored_method = buf.read_i32::<BigEndian>()?;
+                    if password_stored_method != GAUSSDB_SM3_PASSWORD {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported GaussDB SM3 password stored method `{password_stored_method}`"
+                            ),
+                        ));
+                    }
+                    let challenge = buf.read_all();
+                    let body =
+                        AuthenticationGaussdbRfc5802Body::parse(&challenge)?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid message length: GaussDB SM3 challenge is too short",
+                            )
+                        })?;
+                    Message::AuthenticationGaussdbSm3(body)
+                }
                 tag => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -362,14 +388,36 @@ impl AuthenticationSaslBody {
     }
 
     #[inline]
-    pub fn gaussdb_sha256(&self) -> io::Result<Option<AuthenticationGaussdbSha256Body>> {
+    pub fn gaussdb_sha256(&self) -> io::Result<Option<AuthenticationGaussdbRfc5802Body>> {
         if self.0.len() < 4 || self.0[0] != 0 {
             return Ok(None);
         }
 
         let password_stored_method = BigEndian::read_i32(&self.0[..4]);
-        let remaining = &self.0[4..];
-        if !(password_stored_method == 2 || password_stored_method == 0) || remaining.len() < 72 {
+        if !(password_stored_method == 2 || password_stored_method == 0) {
+            return Ok(None);
+        }
+
+        AuthenticationGaussdbRfc5802Body::parse(&self.0[4..])
+    }
+}
+
+/// The RFC5802 challenge GaussDB/openGauss sends for SHA256 and SM3 password
+/// authentication, after the password stored method.
+pub struct AuthenticationGaussdbRfc5802Body {
+    random64code: String,
+    token: String,
+    server_signature: Option<String>,
+    server_iteration: u32,
+}
+
+impl AuthenticationGaussdbRfc5802Body {
+    /// Parses salt (64 hex chars) and token (8 hex chars), optionally followed
+    /// by the server signature (64 hex chars, sent to protocol < 3.50 clients)
+    /// and the iteration count (int32, sent to protocol > 3.50 clients).
+    /// Returns `None` when the salt or token is missing.
+    fn parse(remaining: &[u8]) -> io::Result<Option<Self>> {
+        if remaining.len() < 72 {
             return Ok(None);
         }
 
@@ -390,23 +438,14 @@ impl AuthenticationSaslBody {
                 (None, 10000u32)
             };
 
-        Ok(Some(AuthenticationGaussdbSha256Body {
+        Ok(Some(AuthenticationGaussdbRfc5802Body {
             random64code,
             token,
             server_signature,
             server_iteration,
         }))
     }
-}
 
-pub struct AuthenticationGaussdbSha256Body {
-    random64code: String,
-    token: String,
-    server_signature: Option<String>,
-    server_iteration: u32,
-}
-
-impl AuthenticationGaussdbSha256Body {
     #[inline]
     pub fn random64code(&self) -> &str {
         &self.random64code
@@ -988,4 +1027,70 @@ fn find_null(buf: &[u8], start: usize) -> io::Result<usize> {
 #[inline]
 fn get_str(buf: &[u8]) -> io::Result<&str> {
     str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use bytes::BufMut;
+
+    const SALT: &[u8] = b"2c435cf25c4281aadf6230c5215e270cb37c235548a5f1b341876aca67da6555";
+    const TOKEN: &[u8] = b"5d1e7c3b";
+    const SIGNATURE: &[u8] = b"0cee13cce068ee7f455567c2ed0d006ba1ca767d31ee3b8197dc5c8cd9061fb0";
+
+    fn authentication_message(code: i32, body: &[&[u8]]) -> BytesMut {
+        let len = 8 + body.iter().map(|part| part.len()).sum::<usize>();
+        let mut buf = BytesMut::new();
+        buf.put_u8(AUTHENTICATION_TAG);
+        buf.put_i32(len as i32);
+        buf.put_i32(code);
+        for part in body {
+            buf.put_slice(part);
+        }
+        buf
+    }
+
+    #[test]
+    fn parses_gaussdb_sm3_request() {
+        let stored_method = GAUSSDB_SM3_PASSWORD.to_be_bytes();
+        let iteration = 2048i32.to_be_bytes();
+        // (challenge after the stored method, expected signature, expected iteration)
+        type Case<'a> = (&'a [&'a [u8]], Option<&'a [u8]>, u32);
+        let cases: [Case<'_>; 2] = [
+            // protocol < 3.50: signature, iteration defaults to 10000
+            (&[SALT, TOKEN, SIGNATURE], Some(SIGNATURE), 10000),
+            // protocol > 3.50: iteration count, no signature
+            (&[SALT, TOKEN, &iteration], None, 2048),
+        ];
+
+        for (challenge, signature, server_iteration) in cases {
+            let mut body = vec![&stored_method[..]];
+            body.extend_from_slice(challenge);
+            let mut buf = authentication_message(GAUSSDB_AUTH_REQ_SM3, &body);
+
+            let Some(Message::AuthenticationGaussdbSm3(body)) = Message::parse(&mut buf).unwrap()
+            else {
+                panic!("expected an SM3 authentication request");
+            };
+            assert_eq!(body.random64code().as_bytes(), SALT);
+            assert_eq!(body.token().as_bytes(), TOKEN);
+            assert_eq!(body.server_signature().map(str::as_bytes), signature);
+            assert_eq!(body.server_iteration(), server_iteration);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_gaussdb_sm3_request() {
+        let sha256_stored_method = 2i32.to_be_bytes();
+        let sm3_stored_method = GAUSSDB_SM3_PASSWORD.to_be_bytes();
+        let cases: [&[&[u8]]; 2] = [
+            &[&sha256_stored_method, SALT, TOKEN, SIGNATURE],
+            &[&sm3_stored_method, SALT],
+        ];
+
+        for body in cases {
+            let mut buf = authentication_message(GAUSSDB_AUTH_REQ_SM3, body);
+            assert!(Message::parse(&mut buf).is_err());
+        }
+    }
 }
