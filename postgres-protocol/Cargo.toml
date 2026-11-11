@@ -25,5 +25,6 @@ pbkdf2 = { version = "0.12", features = ["hmac"] }
 rand = "0.10"
 sha1 = "0.10"
 sha2 = "0.11"
+sm3 = "0.5"
 stringprep = "0.1"
 getrandom = { version = "0.4", optional = true }

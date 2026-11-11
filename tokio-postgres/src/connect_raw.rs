@@ -11,7 +11,9 @@ use futures_util::{Sink, SinkExt, Stream, TryStreamExt};
 use postgres_protocol::authentication;
 use postgres_protocol::authentication::sasl;
 use postgres_protocol::authentication::sasl::ScramSha256;
-use postgres_protocol::message::backend::{AuthenticationSaslBody, Message};
+use postgres_protocol::message::backend::{
+    AuthenticationGaussdbRfc5802Body, AuthenticationSaslBody, Message,
+};
 use postgres_protocol::message::frontend;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -194,6 +196,9 @@ where
         Some(Message::AuthenticationSasl(body)) => {
             authenticate_sasl(stream, body, config).await?;
         }
+        Some(Message::AuthenticationGaussdbSm3(body)) => {
+            authenticate_gaussdb_rfc5802(stream, body, config, sasl::gaussdb_rfc5802_sm3).await?;
+        }
         Some(Message::AuthenticationKerberosV5)
         | Some(Message::AuthenticationScmCredential)
         | Some(Message::AuthenticationGss)
@@ -251,7 +256,13 @@ where
     T: TlsStream + Unpin,
 {
     if let Some(gaussdb_body) = body.gaussdb_sha256().map_err(Error::parse)? {
-        return authenticate_gaussdb_sha256(stream, gaussdb_body, config).await;
+        return authenticate_gaussdb_rfc5802(
+            stream,
+            gaussdb_body,
+            config,
+            sasl::gaussdb_rfc5802_sha256,
+        )
+        .await;
     }
 
     let password = config
@@ -374,10 +385,13 @@ where
     Ok(())
 }
 
-async fn authenticate_gaussdb_sha256<S, T>(
+type GaussdbProof = fn(&[u8], &str, &str, Option<&str>, u32) -> Result<String, String>;
+
+async fn authenticate_gaussdb_rfc5802<S, T>(
     stream: &mut StartupStream<S, T>,
-    body: postgres_protocol::message::backend::AuthenticationGaussdbSha256Body,
+    body: AuthenticationGaussdbRfc5802Body,
     config: &Config,
+    compute_proof: GaussdbProof,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -390,7 +404,7 @@ where
         .as_ref()
         .ok_or_else(|| Error::config("password missing".into()))?;
 
-    let proof = sasl::gaussdb_rfc5802_sha256(
+    let proof = compute_proof(
         password,
         body.random64code(),
         body.token(),
